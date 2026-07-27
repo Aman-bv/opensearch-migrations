@@ -77,7 +77,10 @@ public class CapturedTrafficToHttpTransactionAccumulator {
     }
 
     /** Emit a periodic heartbeat log summarizing the accumulator state. */
-    public void logHeartbeat() {
+    /**
+     * Logs accumulator state and force-expires connections idle beyond 1.5x the connection timeout.
+     */
+    public void heartbeatAndExpireStaleConnections() {
         var sb = new StringBuilder();
         int waiting = 0;
         int reads = 0;
@@ -86,8 +89,10 @@ public class CapturedTrafficToHttpTransactionAccumulator {
         String oldestWriteConn = null;
         long oldestWriteLastPacketAgeMs = 0;
         String oldestWriteOffset = null;
+        int wallClockExpired = 0;
 
         var now = System.currentTimeMillis();
+        var wallClockExpiryThresholdMs = connectionTimeout.toMillis() * 3 / 2;
         var allAccumulations = liveStreams.values().collect(java.util.stream.Collectors.toList());
         int liveConnections = allAccumulations.size();
 
@@ -98,15 +103,21 @@ public class CapturedTrafficToHttpTransactionAccumulator {
                 case ACCUMULATING_WRITES: writes++; break;
                 case IGNORING_LAST_REQUEST: ignoring++; break;
             }
-            if (accum.state == Accumulation.State.ACCUMULATING_WRITES) {
-                var lastPacketMs = accum.getNewestPacketTimestampInMillisReference().get();
-                var lastPacketAge = lastPacketMs > 0 ? now - lastPacketMs : 0;
-                // Use lastPacketAge as a proxy for how long this accumulation has been stuck
-                if (lastPacketAge > oldestWriteLastPacketAgeMs) {
-                    oldestWriteLastPacketAgeMs = lastPacketAge;
-                    oldestWriteConn = accum.trafficChannelKey.getConnectionId();
-                    oldestWriteOffset = accum.trafficChannelKey.toString();
-                }
+            var lastPacketMs = accum.getNewestPacketTimestampInMillisReference().get();
+            var lastPacketAge = lastPacketMs > 0 ? now - lastPacketMs : 0;
+            if (lastPacketAge > wallClockExpiryThresholdMs) {
+                wallClockExpired++;
+                log.atWarn().setMessage("Wall-clock expiry: connection {} idle for {}ms (threshold={}ms). "
+                        + "Source-time-based expiry failed to fire — force-expiring.")
+                    .addArgument(accum.trafficChannelKey)
+                    .addArgument(lastPacketAge)
+                    .addArgument(wallClockExpiryThresholdMs).log();
+                fireAccumulationsCallbacksAndClose(accum, RequestResponsePacketPair.ReconstructionStatus.EXPIRED_PREMATURELY);
+            }
+            if (accum.state == Accumulation.State.ACCUMULATING_WRITES && lastPacketAge > oldestWriteLastPacketAgeMs) {
+                oldestWriteLastPacketAgeMs = lastPacketAge;
+                oldestWriteConn = accum.trafficChannelKey.getConnectionId();
+                oldestWriteOffset = accum.trafficChannelKey.toString();
             }
         }
 
@@ -127,7 +138,8 @@ public class CapturedTrafficToHttpTransactionAccumulator {
         sb.append(" totals={requests=").append(requestCounter.get())
             .append(", closed=").append(closedConnectionCounter.get())
             .append(", expired=").append(connectionsExpiredCounter.get())
-            .append(", exceptions=").append(exceptionConnectionCounter.get()).append("}");
+            .append(", exceptions=").append(exceptionConnectionCounter.get())
+            .append(", wallClockExpired=").append(wallClockExpired).append("}");
 
         heartbeatLogger.atInfo().setMessage("{}").addArgument(sb).log();
     }
@@ -440,10 +452,16 @@ public class CapturedTrafficToHttpTransactionAccumulator {
             );
             return Optional.of(CONNECTION_STATUS.CLOSED);
         } else if (observation.hasConnectionException()) {
-            accum.getOrCreateTransactionPair(trafficStreamKey, originTimestamp).holdTrafficStream(trafficStreamKey);
             rotateAccumulationIfNecessary(trafficStreamKey.getConnectionId(), accum);
             exceptionConnectionCounter.incrementAndGet();
-            accum.resetForNextRequest();
+            // Commit all held TSKs before nulling the rrPair. Without this, offsets from
+            // prior TrafficStream records that contributed to the in-progress request are
+            // permanently orphaned in OffsetLifecycleTracker, pinning the partition's commit
+            // pointer forever (same pattern as handleDroppedRequestForAccumulation).
+            // Note: we do NOT holdTrafficStream(trafficStreamKey) first — that would cause
+            // the current record's TSK to be double-committed (once here, once by the
+            // end-of-accept() fallback). The current record is committed by the fallback.
+            handleDroppedRequestForAccumulation(accum);
             log.atDebug()
                 .setMessage("Removing accumulated traffic pair due to recorded connection exception event for {}")
                 .addArgument(trafficStreamKey::getConnectionId)
@@ -691,6 +709,13 @@ public class CapturedTrafficToHttpTransactionAccumulator {
                             accumulation.trafficChannelKey.getTrafficStreamsContext(),
                             Collections.unmodifiableList(accumulation.getRrPair().trafficStreamKeysBeingHeld)
                         );
+                        // Null the rrPair so the finally-block's onConnectionClose (which
+                        // always runs despite the return) does not double-commit the same
+                        // TSKs — getTrafficStreamsHeldByAccum returns List.of() when
+                        // hasRrPair()==false. Without this, keep-alive connections expiring
+                        // mid-second-request hit IllegalStateException in
+                        // OffsetLifecycleTracker.removeAndReturnNewHead (double-remove).
+                        accumulation.resetForNextRequest();
                     }
                     return;
                 case ACCUMULATING_WRITES:
